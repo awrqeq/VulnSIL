@@ -42,7 +42,7 @@ class HybridRetriever:
         except Exception as e:
             logger.error(f"Retriever Init Error: {e}")
 
-    def _rrf_fusion(self, rank_lists: List[List[int]], k: int = 60) -> Dict[int, float]:
+    def _rrf_fusion(self, rank_lists: List[List[int]], k: int) -> Dict[int, float]:
         rrf_map = {}
         for rank_list in rank_lists:
             for rank, doc_id in enumerate(rank_list):
@@ -55,7 +55,7 @@ class HybridRetriever:
         if not self.faiss_index or not self.embedding_model:
             return []
 
-        candidate_k = top_k * 4
+        candidate_k = top_k * settings.RETRIEVAL_VECTOR_CANDIDATE_MULTIPLIER
 
         # 1. Vector Search
         query_vec = self.embedding_model.encode(code_query).reshape(1, -1)
@@ -72,17 +72,17 @@ class HybridRetriever:
         tokens = code_query.split()
         if not tokens: tokens = ["void"] # fallback
 
-        scores = self.bm25_model.get_scores(tokens)
-        # numpy argsort is ascending, take reverse
-        top_n_idx = np.argsort(scores)[::-1][:candidate_k]
-
         bm25_ids = []
-        for idx in top_n_idx:
-            if 0 <= idx < len(self.ids_map):
-                bm25_ids.append(self.ids_map[idx])
+        if self.bm25_model:
+            scores = self.bm25_model.get_scores(tokens)
+            top_n_idx = np.argsort(scores)[::-1][:candidate_k]
+
+            for idx in top_n_idx:
+                if 0 <= idx < len(self.ids_map):
+                    bm25_ids.append(self.ids_map[idx])
 
         # 3. Fusion
-        fused = self._rrf_fusion([vector_ids, bm25_ids])
+        fused = self._rrf_fusion([vector_ids, bm25_ids], settings.RETRIEVAL_RRF_K)
         sorted_ids = sorted(fused.keys(), key=lambda x: fused[x], reverse=True)[:top_k]
 
         results = []

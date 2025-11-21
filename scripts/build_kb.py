@@ -136,10 +136,9 @@ def import_rag_data_scan(db):
         # 批量入库
         if batch_buffer:
             try:
-                # 分批 commit 防止过大
-                BATCH_SIZE = 1000
-                for i in range(0, len(batch_buffer), BATCH_SIZE):
-                    chunk = batch_buffer[i:i + BATCH_SIZE]
+                batch_size = settings.KB_BUILD_BATCH_INSERT_SIZE
+                for i in range(0, len(batch_buffer), batch_size):
+                    chunk = batch_buffer[i:i + batch_size]
                     db.bulk_save_objects(chunk)
                     db.commit()  # 每一小批提交一次，降低内存压力
 
@@ -184,7 +183,7 @@ def build_indices(db):
 
     # 分页查询避免内存爆炸
     total_entries = db.query(KnowledgeBase.id).count()
-    chunk_size = 5000
+    chunk_size = settings.KB_BUILD_CHUNK_SIZE
 
     vectors_list = []
     tokenized_corpus = []

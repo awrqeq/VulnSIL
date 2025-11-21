@@ -1,34 +1,27 @@
 # run_pipeline.py
-import typer
-import logging
-import joblib
-import os
 import gc
-import torch
+import logging
+import os
 import threading
-import numpy as np
-# 使用 as_completed 做并发控制
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from sqlalchemy.exc import SQLAlchemyError
 
-from vulnsil.database import get_db_session
-from vulnsil.models import Vulnerability, AnalysisResultRecord
-from vulnsil.core.static_analysis.engine import DualEngineAnalyzer
-from vulnsil.core.retrieval.hybrid_search import HybridRetriever
-from vulnsil.core.llm.vllm_client import VLLMClient
-from vulnsil.core.llm.prompts import PromptManager
-from vulnsil.utils_log import setup_logging
+import joblib
+import numpy as np
+import torch
+import typer
+from tqdm import tqdm
+
 from config import settings
+from vulnsil.core.llm.prompts import PromptManager
+from vulnsil.core.llm.vllm_client import VLLMClient
+from vulnsil.core.retrieval.hybrid_search import HybridRetriever
+from vulnsil.core.static_analysis.engine import DualEngineAnalyzer
+from vulnsil.database import get_db_session
+from vulnsil.models import AnalysisResultRecord, Vulnerability
+from vulnsil.utils_log import setup_logging
 
 app = typer.Typer()
 logger = setup_logging("pipeline")
-
-# --- Config: 批处理模式优化参数 ---
-# 推理阶段并发数 (Static已在主线程批量完成)
-FIXED_THREAD_COUNT = 24
-# 静态分析批次大小 (一次启动分析 500-1000 个最佳)
-BATCH_SIZE_STATIC = 500
 
 STOP_EVENT = threading.Event()
 
@@ -74,7 +67,10 @@ def process_inference_task(task: dict, static_feats: dict):
             flow_desc = "NO"
 
         # 1. RAG
-        raw_rag = RETRIEVER.search(safe_code, top_k=settings.RAG_TOP_K + 5)
+        raw_rag = RETRIEVER.search(
+            safe_code,
+            top_k=settings.RAG_TOP_K + settings.RAG_CANDIDATE_PADDING,
+        )
         final_rag = []
         curr_k = 0
         for e in raw_rag:
@@ -142,55 +138,62 @@ def process_inference_task(task: dict, static_feats: dict):
         return "Failed"
 
 
-def run_batched_pipeline(task_ids):
-    # 拆分大批次
-    total_len = len(task_ids)
-    batches = [task_ids[i:i + BATCH_SIZE_STATIC] for i in range(0, total_len, BATCH_SIZE_STATIC)]
+def _yield_batches(task_ids, batch_size):
+    for i in range(0, len(task_ids), batch_size):
+        yield task_ids[i:i + batch_size]
 
-    logger.info(f"🚀 Pipeline Start: {total_len} tasks | {len(batches)} Batches | Mode: Batch-Static -> Async-Infer")
+
+def _load_tasks(chunk_ids):
+    tasks = []
+    try:
+        with get_db_session() as db:
+            rows = db.query(Vulnerability).filter(Vulnerability.id.in_(chunk_ids)).all()
+            for r in rows:
+                tasks.append({"id": r.id, "name": r.name, "code": r.code, "cwe_id": r.cwe_id})
+    except Exception as exc:
+        logger.error(f"DB load failed: {exc}")
+    return tasks
+
+
+def _run_parallel_inference(tasks, static_results_map, pbar):
+    try:
+        with ThreadPoolExecutor(max_workers=settings.INFERENCE_THREAD_COUNT) as ex:
+            futures = []
+            for t in tasks:
+                if STOP_EVENT.is_set():
+                    break
+                feat = static_results_map.get(t['id'])
+                futures.append(ex.submit(process_inference_task, t, feat))
+
+            for f in as_completed(futures):
+                if STOP_EVENT.is_set():
+                    break
+                f.result()
+                pbar.update(1)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        logger.error(f"Inference worker failure: {exc}")
+
+
+def run_batched_pipeline(task_ids):
+    total_len = len(task_ids)
+    batch_size = settings.STATIC_BATCH_SIZE
+    logger.info(
+        f"🚀 Pipeline Start: {total_len} tasks | Batch Size: {batch_size} | Mode: Batch-Static -> Async-Infer"
+    )
 
     with tqdm(total=total_len, desc="Processing") as pbar:
-        for chunk_ids in batches:
-            if STOP_EVENT.is_set(): break
+        for chunk_ids in _yield_batches(task_ids, batch_size):
+            if STOP_EVENT.is_set():
+                break
 
-            # 1. 加载数据
-            tasks = []
-            try:
-                with get_db_session() as db:
-                    rows = db.query(Vulnerability).filter(Vulnerability.id.in_(chunk_ids)).all()
-                    for r in rows:
-                        tasks.append({
-                            "id": r.id, "name": r.name, "code": r.code,
-                            "cwe_id": r.cwe_id
-                        })
-            except Exception:
-                continue  # DB error skip batch
+            tasks = _load_tasks(chunk_ids)
+            if not tasks:
+                continue
 
-            if not tasks: continue
-
-            # 2. [Batch Static] 这一步是阻塞的，但非常快
-            # pbar.set_description("Static Analysis...")
             static_results_map = STATIC_ENGINE.analyze_batch(tasks)
-
-            # 3. [Concurrent Inference]
-            # pbar.set_description("LLM Inference...")
-            try:
-                with ThreadPoolExecutor(max_workers=FIXED_THREAD_COUNT) as ex:
-                    futures = []
-                    for t in tasks:
-                        if STOP_EVENT.is_set(): break
-                        # 获取特征 (一定有，因为 map 初始化过默认值)
-                        feat = static_results_map.get(t['id'])
-                        futures.append(ex.submit(process_inference_task, t, feat))
-
-                    for f in as_completed(futures):
-                        if STOP_EVENT.is_set(): break
-                        f.result()
-                        pbar.update(1)
-            except KeyboardInterrupt:
-                raise
-
-            # 4. GC
+            _run_parallel_inference(tasks, static_results_map, pbar)
             manual_gc()
 
 
