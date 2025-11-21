@@ -16,16 +16,11 @@ class VLLMClient:
         payload = {
             "model": settings.LLM_MODEL_NAME,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,
-
-            # [修复核心]: 增加最大生成长度，防止长思维链导致 JSON 截断
-            # 512 -> 2048，预留足够空间给 thought_process 和 evidence
-            "max_tokens": 2048,
-            # [新增关键参数]: 重复惩罚 1.1 
-            "repetition_penalty": 1.1,
-            # 强制 Pydantic Schema 约束，确保 JSON 格式
+            "temperature": settings.LLM_TEMPERATURE,
+            "max_tokens": settings.LLM_MAX_TOKENS,
+            "repetition_penalty": settings.LLM_REPETITION_PENALTY,
             "guided_json": AnalysisResult.model_json_schema(),
-            "logprobs": True
+            "logprobs": True,
         }
 
         try:
@@ -33,7 +28,7 @@ class VLLMClient:
                 settings.LLM_API_URL,
                 json=payload,
                 # [优化]: 生成长度增加后，推理耗时会变长，放宽超时限制
-                timeout=240
+                timeout=settings.LLM_TIMEOUT
             )
 
             if resp.status_code != 200:
