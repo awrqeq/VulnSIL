@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     STATIC_TMP_DIR: str = "/dev/shm"
     INFERENCE_THREAD_COUNT: int = 24
 
-    # 检索/索引参数
+    # 检索索引参数
     RETRIEVAL_RRF_K: int = 60
     RETRIEVAL_VECTOR_CANDIDATE_MULTIPLIER: int = 4
     KB_BUILD_CHUNK_SIZE: int = 5000
